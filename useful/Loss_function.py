@@ -31,7 +31,7 @@ class DiceLoss(nn.Module):
         # Compute Dice loss
         dice_loss = 1 - dice_coef
 
-        return dice_loss
+        return dice_loss.detach().clone().require_grad()
 
 
 class TeacherAuxiliaryLoss(nn.Module):
