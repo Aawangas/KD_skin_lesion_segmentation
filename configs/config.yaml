@@ -1,0 +1,29 @@
+# Training Configuration
+teacher:
+  backbone: "resnet"
+  num_classes: 1
+  output_stride: 8
+  weight_path: "models/model_files/teacher1.pth"
+
+student:
+  type: "raw"  # or "distill"
+  num_classes: 1
+  weight_path: "student1.pth"
+
+data:
+  train_img_dir: "autodl-tmp/training_images/"
+  train_gt_dir: "autodl-tmp/ISIC2018_Task1_Training_GroundTruth/"
+  val_img_dir: "autodl-tmp/validate_images/"
+  val_gt_dir: "autodl-tmp/ISIC2018_Task1_Validation_GroundTruth/"
+  test_img_dir: "autodl-tmp/testing_images/"
+  test_gt_dir: "autodl-tmp/ISIC2018_Task1_Test_GroundTruth/"
+  batch_size: 32
+
+train:
+  epochs: 200
+  learning_rate: 0.001
+  patience: 10
+  device: "cuda"
+  save_path: "checkpoints/"
+  log_path: "logs/"
+

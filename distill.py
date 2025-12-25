@@ -1,139 +1,131 @@
+import argparse
 import torch
-from torch.utils.data import Dataset, DataLoader
-from models.TS_models import Teacher, Student
-from PIL import Image
-import train_teacher as train_teacher
-import os
-from useful.Loss_function import StudentDistillLoss, DiceLoss
-from useful import DataAugmentation, Dataset_loader, Loss_function
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-import useful.Training_testing as Training_testing
+import os
 
+from models.ts_models import Teacher, Student
+from utils import datasets, augmentations, losses, trainer, config
 
-def load_teacher(flag):
-    teacher = Teacher(flag)
-    weight_path = "/Users/wanganbang/Documents/GitHub/DLSkinLesionSeg/KnowledgeDistillation/models/model_files/teacher1.pth"
-    state_dict = torch.load(weight_path, map_location='cpu')
-    teacher.load_state_dict(state_dict)
-    return teacher
+def get_args():
+    parser = argparse.ArgumentParser(description="Knowledge Distillation for Skin Lesion Segmentation")
+    parser.add_argument("--config", type=str, default="configs/config.yaml", help="Path to config file")
+    parser.add_argument("--mode", type=str, choices=['distill', 'raw', 'test'], default='distill', help="Training mode")
+    parser.add_argument("--teacher_weights", type=str, help="Path to teacher weights")
+    parser.add_argument("--student_weights", type=str, help="Path to student weights (for testing)")
+    return parser.parse_args()
 
+def load_teacher(weight_path, device):
+    teacher = Teacher('eval')
+    if os.path.exists(weight_path):
+        state_dict = torch.load(weight_path, map_location='cpu')
+        teacher.load_state_dict(state_dict)
+        print(f"Loaded teacher weights from {weight_path}")
+    else:
+        print(f"Warning: Teacher weight path {weight_path} not found.")
+    return teacher.to(device)
 
-class TeacherDataset(Dataset):
+def run_distill(cfg, args):
+    device = cfg['train']['device']
+    batch_size = cfg['data']['batch_size']
+    
+    # Load teacher for distillation
+    teacher_path = args.teacher_weights or cfg['teacher']['weight_path']
+    teacher = load_teacher(teacher_path, device)
+    
+    # Transforms
+    train_transform = augmentations.get_train_transform()
+    val_transform = augmentations.get_val_transform()
+    
+    # Datasets
+    train_dataset = datasets.TeacherDataset(
+        cfg['data']['train_img_dir'], cfg['data']['train_gt_dir'], 
+        train_transform, teacher, device
+    )
+    val_dataset = datasets.SkinDataset(
+        cfg['data']['val_img_dir'], cfg['data']['val_gt_dir'], 
+        val_transform
+    )
+    
+    train_loader = datasets.get_dataloader(train_dataset, batch_size)
+    val_loader = datasets.get_dataloader(val_dataset, batch_size, shuffle=False)
+    
+    # Student model
+    model = Student().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=cfg['train']['learning_rate'])
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=cfg['train']['patience'])
+    
+    # Distillation Loss
+    loss_fn = losses.StudentDistillLoss(flag='full')
+    val_loss_fn = losses.DiceLoss(threshold=0.5)
+    
+    # Paths
+    os.makedirs(cfg['train']['save_path'], exist_ok=True)
+    model_path = os.path.join(cfg['train']['save_path'], "student_distill.pth")
+    loss_path = os.path.join(cfg['train']['save_path'], "student_distill.json")
+    
+    trainer.training_loop(
+        cfg['train']['epochs'], train_loader, val_loader, model,
+        loss_fn, val_loss_fn, optimizer, scheduler,
+        device, model_path, loss_path
+    )
 
-    # We don't need to apply data augmentation to output from teacher
-    # The dataset should be (image, ground_truth, teacher_output, teacher_auxi_dict)
-    def __init__(self, img_dir, gt_dir, transform, model):
-        self.transform = transform
-        valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.gif')  # 添加你需要的图像格式
+def run_raw_student(cfg):
+    device = cfg['train']['device']
+    batch_size = cfg['data']['batch_size']
+    
+    train_transform = augmentations.get_train_transform()
+    val_transform = augmentations.get_val_transform()
+    
+    train_dataset = datasets.SkinDataset(cfg['data']['train_img_dir'], cfg['data']['train_gt_dir'], train_transform)
+    val_dataset = datasets.SkinDataset(cfg['data']['val_img_dir'], cfg['data']['val_gt_dir'], val_transform)
+    
+    train_loader = datasets.get_dataloader(train_dataset, batch_size)
+    val_loader = datasets.get_dataloader(val_dataset, batch_size, shuffle=False)
+    
+    model = Student(flag='raw').to(device)
+    optimizer = optim.Adam(model.parameters(), lr=cfg['train']['learning_rate'])
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=cfg['train']['patience'])
+    
+    loss_fn = losses.DiceLoss(threshold=None) # Raw training usually uses BCE or soft Dice
+    val_loss_fn = losses.DiceLoss(threshold=0.5)
+    
+    os.makedirs(cfg['train']['save_path'], exist_ok=True)
+    model_path = os.path.join(cfg['train']['save_path'], "student_raw.pth")
+    loss_path = os.path.join(cfg['train']['save_path'], "student_raw.json")
+    
+    trainer.training_loop(
+        cfg['train']['epochs'], train_loader, val_loader, model,
+        loss_fn, val_loss_fn, optimizer, scheduler,
+        device, model_path, loss_path
+    )
 
-        self.image_paths = [os.path.join(img_dir, f) for f in os.listdir(img_dir)
-                            if f.lower().endswith(valid_extensions)]
-        self.gt_paths = [os.path.join(gt_dir, f) for f in os.listdir(gt_dir)
-                         if f.lower().endswith(valid_extensions)]
-        self.image_paths.sort()
-        self.gt_paths.sort()
-        self.model = model
+def run_test(cfg, args):
+    device = cfg['train']['device']
+    val_transform = augmentations.get_val_transform()
+    test_dataset = datasets.SkinDataset(cfg['data']['test_img_dir'], cfg['data']['test_gt_dir'], val_transform)
+    test_loader = datasets.get_dataloader(test_dataset, cfg['data']['batch_size'], shuffle=False)
+    
+    model = Student(flag='eval').to(device)
+    model_path = args.student_weights or os.path.join(cfg['train']['save_path'], "student_distill.pth")
+    
+    if os.path.exists(model_path):
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        print(f"Loaded student weights from {model_path}")
+        trainer.test(test_loader, model, device)
+    else:
+        print(f"Error: Student weights not found at {model_path}")
 
-    def __len__(self):
-        return len(self.image_paths)
+def main():
+    args = get_args()
+    cfg = config.load_config(args.config)
+    
+    if args.mode == 'distill':
+        run_distill(cfg, args)
+    elif args.mode == 'raw':
+        run_raw_student(cfg)
+    elif args.mode == 'test':
+        run_test(cfg, args)
 
-    def __getitem__(self, idx):
-        image = Image.open(self.image_paths[idx]).convert("RGB")
-        gt = Image.open(self.gt_paths[idx]).convert("L")
-        image, gt = self.transform(image, gt)
-        self.model.eval()
-        with torch.no_grad():
-            teacher_output = self.model(image.unsqueeze(0).to('cuda'))
-            teacher_output['main_output'] = teacher_output['main_output'].to('cpu')
-            teacher_output['main_output'] = teacher_output['main_output'].squeeze(0)
-            for key in teacher_output['auxi_dict']:
-                teacher_output['auxi_dict'][key] = teacher_output['auxi_dict'][key].to('cpu')
-                teacher_output['auxi_dict'][key] = teacher_output['auxi_dict'][key].squeeze(0)
-            teacher_output['gt'] = gt
-            teacher_output['gt'] = teacher_output['gt'].to('cpu')
-            teacher_output['gt'] = teacher_output['gt'].squeeze(0)
-        # If we make the Dataset standard, we don't have to change out training_with_validation function
-        return image, teacher_output
-
-
-def load_dataloader():
-    # We should load train dataset, validate dataset and test dataset here and convert them into
-    # dataloader
-    model = train_teacher.load_teacher('eval')
-    model = model.to('cuda')
-    train_transform = DataAugmentation.train_transform
-    validate_test_transform = DataAugmentation.vanilla_transform
-    # We are supposed to have 3 different datasets, but still, we load all data at the same time
-    train_dataset = TeacherDataset("autodl-tmp/training_images/",
-                                   "autodl-tmp/ISIC2018_Task1_Training_GroundTruth/",
-                                   train_transform, model)
-    validate_dataset = Dataset_loader.SkinDataset("autodl-tmp/validate_images/",
-                                                  "autodl-tmp/ISIC2018_Task1_Validation_GroundTruth/",
-                                                  validate_test_transform)
-    test_dataset = Dataset_loader.SkinDataset("autodl-tmp/testing_images/",
-                                              "autodl-tmp/ISIC2018_Task1_Test_GroundTruth/",
-                                              validate_test_transform)
-    train_dataloader = Dataset_loader.get_dataloader(train_dataset, 32)
-    validate_dataset = Dataset_loader.get_dataloader(validate_dataset, 32)
-    test_dataloader = Dataset_loader.get_dataloader(test_dataset, 32)
-
-    return train_dataloader, validate_dataset, test_dataloader
-
-
-def distill_with_auxi():
-    model = Student()
-    model = model.to("cuda")
-
-    train_dataloader, validate_dataloader, test_dataloader = load_dataloader()
-
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10, verbose=True)
-    loss_fn = StudentDistillLoss()
-    model_path = "student1.pth"
-    loss_path = "student1.json"
-    Training_testing.training_process_with_validation(200, train_dataloader, validate_dataloader,
-                                                      model, loss_fn, DiceLoss(0.5), optimizer, scheduler, model_path,
-                                                      loss_path)
-
-
-def load_raw_dataloader():
-    train_transform = DataAugmentation.train_transform
-    validate_test_transform = DataAugmentation.vanilla_transform
-    # We are supposed to have 3 different datasets, but still, we load all data at the same time
-    train_dataset = Dataset_loader.SkinDataset("autodl-tmp/training_images/",
-                                               "autodl-tmp/ISIC2018_Task1_Training_GroundTruth/",
-                                               train_transform)
-    validate_dataset = Dataset_loader.SkinDataset("autodl-tmp/validate_images/",
-                                                  "autodl-tmp/ISIC2018_Task1_Validation_GroundTruth/",
-                                                  validate_test_transform)
-    test_dataset = Dataset_loader.SkinDataset("autodl-tmp/testing_images/",
-                                              "autodl-tmp/ISIC2018_Task1_Test_GroundTruth/",
-                                              validate_test_transform)
-    train_dataloader = Dataset_loader.get_dataloader(train_dataset, 32)
-    validate_dataset = Dataset_loader.get_dataloader(validate_dataset, 32)
-    test_dataloader = Dataset_loader.get_dataloader(test_dataset, 32)
-
-    return train_dataloader, validate_dataset, test_dataloader
-
-def train_raw_student():
-    model = Student(flag='raw')
-    train_dataloader, validate_dataloader, test_dataloader = load_dataloader()
-
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10, verbose=True)
-    loss_fn = DiceLoss(0.5)
-    model_path = "student_raw.pth"
-    loss_path = "student_raw.json"
-    Training_testing.training_process_with_validation(200, train_dataloader, validate_dataloader,
-                                                      model, loss_fn, DiceLoss(0.5), optimizer, scheduler, model_path,
-                                                      loss_path)
-def test(model_path):
-    _, _, test_dataloader = load_dataloader()
-    model = Student('eval')
-    state_dict = torch.load(model_path)
-    model.load_state_dict(state_dict)
-    model = model.to("cuda")
-    Training_testing.test(test_dataloader, model)
-
-
+if __name__ == "__main__":
+    main()
